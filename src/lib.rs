@@ -87,7 +87,7 @@ pub struct Attestation {
     pub mode: Mode,
     /// base64url(UTF8(protected_header_json))
     pub protected: String,
-    /// base64url(64-byte Ed25519 signature)
+    /// base64url of the 64-byte signature — Ed25519, or JOSE fixed `r||s` for ES256.
     pub signature: String,
 }
 
@@ -122,11 +122,18 @@ pub fn sign<C: AttestableCore>(
     }
 }
 
-/// Verify an attestation against a core and a raw Ed25519 public key (32 bytes).
+/// Verify an attestation against a core and the signer's public key.
 ///
-/// Returns `false` on any decode/parse/signature failure — never panics on bad
-/// input. The protected header is bound into the signed input exactly as
-/// received, so a tampered header invalidates the signature.
+/// Dispatches on the protected `alg`:
+/// - `EdDSA` — `public_key` is the 32-byte raw Ed25519 key.
+/// - `ES256` — `public_key` is the 65-byte uncompressed P-256 point
+///   (`0x04 || x || y`); the signature is JOSE fixed-form `r||s` (64 bytes).
+///
+/// Any other `alg` is rejected. Returns `false` on any decode/parse/signature
+/// failure — never panics on bad input. The protected header is bound into the
+/// signed input exactly as received, so a tampered header (including a swapped
+/// `alg`) invalidates the signature; a key whose type doesn't match `alg` simply
+/// fails to verify, so the two algorithms cannot be confused.
 #[must_use]
 pub fn verify<C: AttestableCore>(core: &C, att: &Attestation, public_key: &[u8]) -> bool {
     let Ok(sig) = B64.decode(att.signature.as_bytes()) else {
@@ -138,11 +145,13 @@ pub fn verify<C: AttestableCore>(core: &C, att: &Attestation, public_key: &[u8])
     let Ok(header) = serde_json::from_slice::<ProtectedHeader>(&header_bytes) else {
         return false;
     };
-    if header.alg != "EdDSA" {
-        return false;
-    }
+    let alg: &'static dyn signature::VerificationAlgorithm = match header.alg.as_str() {
+        "EdDSA" => &signature::ED25519,
+        "ES256" => &signature::ECDSA_P256_SHA256_FIXED,
+        _ => return false,
+    };
     let input = signing_input(&att.protected, core);
-    signature::UnparsedPublicKey::new(&signature::ED25519, public_key)
+    signature::UnparsedPublicKey::new(alg, public_key)
         .verify(&input, &sig)
         .is_ok()
 }
@@ -212,6 +221,244 @@ impl NotaryKey {
                 "use": "sig",
             }]
         })
+    }
+}
+
+/// ES256 / P-256 notary signing custodied in AWS KMS — the private key never
+/// leaves KMS; each signature is one KMS `Sign` call over the signing input.
+/// Behind the `kms` feature so EdDSA-only consumers don't pull the AWS SDK.
+///
+/// Produces `alg: "ES256"` attestations that [`verify`] checks against the
+/// 65-byte uncompressed P-256 point ([`KmsNotary::public_point`] / the JWKS).
+#[cfg(feature = "kms")]
+pub mod kms {
+    use super::{signing_input, AttestableCore, Attestation, Mode, ProtectedHeader, B64};
+    use base64::Engine;
+    use serde_json::json;
+
+    use aws_sdk_kms::primitives::Blob;
+    use aws_sdk_kms::types::{MessageType, SigningAlgorithmSpec};
+    use aws_sdk_kms::Client as KmsClient;
+
+    /// A KMS-backed ES256 signing failure (key fetch, sign call, or malformed
+    /// KMS output).
+    #[derive(Debug, thiserror::Error)]
+    pub enum KmsError {
+        #[error("KMS GetPublicKey failed: {0}")]
+        GetPublicKey(String),
+        #[error("KMS Sign failed: {0}")]
+        Sign(String),
+        #[error("KMS returned a malformed {0}")]
+        Malformed(&'static str),
+    }
+
+    /// The service-global ES256 notary, custodied in AWS KMS.
+    ///
+    /// [`new`](KmsNotary::new) fetches the public key once (for a stable `kid` +
+    /// the JWKS); each [`sign`](KmsNotary::sign) is one KMS `Sign` call whose DER
+    /// ECDSA output is converted to the 64-byte JOSE form.
+    pub struct KmsNotary {
+        client: KmsClient,
+        key_id: String,
+        kid: String,
+        /// Uncompressed SEC1 point: `0x04 || x(32) || y(32)`.
+        point: [u8; 65],
+    }
+
+    impl KmsNotary {
+        /// Build from a KMS key id/ARN (an asymmetric `ECC_NIST_P256`,
+        /// `SIGN_VERIFY` key). `kid_prefix` namespaces the JWKS `kid`, e.g.
+        /// `"gotta"` → `"gotta-notary-<12 b64 chars of the point>"`. The kid is
+        /// stable across cold starts because the KMS key is stable.
+        pub async fn new(
+            client: KmsClient,
+            key_id: impl Into<String>,
+            kid_prefix: &str,
+        ) -> Result<Self, KmsError> {
+            let key_id = key_id.into();
+            let resp = client
+                .get_public_key()
+                .key_id(&key_id)
+                .send()
+                .await
+                .map_err(|e| KmsError::GetPublicKey(e.to_string()))?;
+            let spki = resp
+                .public_key()
+                .ok_or(KmsError::Malformed("GetPublicKey response (no key)"))?
+                .as_ref();
+            let point = ec_point_from_spki(spki)?;
+            let kid = format!("{kid_prefix}-notary-{}", &B64.encode(point)[..12]);
+            Ok(Self {
+                client,
+                key_id,
+                kid,
+                point,
+            })
+        }
+
+        #[must_use]
+        pub fn kid(&self) -> &str {
+            &self.kid
+        }
+
+        /// The uncompressed P-256 point (`0x04 || x || y`) — the public-key bytes
+        /// [`super::verify`] expects for an `ES256` attestation.
+        #[must_use]
+        pub fn public_point(&self) -> &[u8; 65] {
+            &self.point
+        }
+
+        /// Notary-sign a core (`Mode::Notary`) via KMS → an ES256 attestation.
+        pub async fn sign<C: AttestableCore>(&self, core: &C) -> Result<Attestation, KmsError> {
+            let header = ProtectedHeader {
+                alg: "ES256".into(),
+                kid: self.kid.clone(),
+                typ: C::ENVELOPE_TYP.into(),
+            };
+            let protected = B64.encode(serde_json::to_vec(&header).expect("header serializes"));
+            let input = signing_input(&protected, core);
+            let resp = self
+                .client
+                .sign()
+                .key_id(&self.key_id)
+                .signing_algorithm(SigningAlgorithmSpec::EcdsaSha256)
+                .message_type(MessageType::Raw)
+                .message(Blob::new(input))
+                .send()
+                .await
+                .map_err(|e| KmsError::Sign(e.to_string()))?;
+            let der = resp
+                .signature()
+                .ok_or(KmsError::Malformed("Sign response (no signature)"))?
+                .as_ref();
+            let raw = der_ecdsa_to_p256_fixed(der)?;
+            Ok(Attestation {
+                mode: Mode::Notary,
+                protected,
+                signature: B64.encode(raw),
+            })
+        }
+
+        /// The JWKS document (one EC P-256 key) for client-side verify.
+        #[must_use]
+        pub fn jwks(&self) -> serde_json::Value {
+            let x = B64.encode(&self.point[1..33]);
+            let y = B64.encode(&self.point[33..65]);
+            json!({
+                "keys": [{
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "x": x,
+                    "y": y,
+                    "kid": self.kid,
+                    "alg": "ES256",
+                    "use": "sig",
+                }]
+            })
+        }
+    }
+
+    /// Extract the 65-byte uncompressed EC point from a DER SubjectPublicKeyInfo.
+    /// For P-256 the SPKI's trailing 65 bytes are the BIT STRING content
+    /// (`0x04 || x(32) || y(32)`); validate the length + the `0x04` prefix.
+    fn ec_point_from_spki(spki: &[u8]) -> Result<[u8; 65], KmsError> {
+        if spki.len() < 65 {
+            return Err(KmsError::Malformed("SPKI (too short)"));
+        }
+        let tail = &spki[spki.len() - 65..];
+        if tail[0] != 0x04 {
+            return Err(KmsError::Malformed("SPKI (not an uncompressed point)"));
+        }
+        let mut point = [0u8; 65];
+        point.copy_from_slice(tail);
+        Ok(point)
+    }
+
+    /// Convert a DER ECDSA-P256 signature (`SEQUENCE { INTEGER r, INTEGER s }`)
+    /// to the 64-byte JOSE fixed form (`r||s`, each left-padded to 32 bytes).
+    fn der_ecdsa_to_p256_fixed(der: &[u8]) -> Result<[u8; 64], KmsError> {
+        let bad = || KmsError::Malformed("ECDSA DER signature");
+        if der.len() < 8 || der[0] != 0x30 {
+            return Err(bad());
+        }
+        // SEQUENCE length is short-form (< 128) for a P-256 signature.
+        let mut i = 2usize;
+        let mut read_int = |buf: &[u8]| -> Result<Vec<u8>, KmsError> {
+            if i + 2 > buf.len() || buf[i] != 0x02 {
+                return Err(bad());
+            }
+            let len = buf[i + 1] as usize;
+            let start = i + 2;
+            let end = start.checked_add(len).ok_or_else(bad)?;
+            if end > buf.len() {
+                return Err(bad());
+            }
+            i = end;
+            Ok(buf[start..end].to_vec())
+        };
+        let r = read_int(der)?;
+        let s = read_int(der)?;
+        let mut out = [0u8; 64];
+        place_be(&r, &mut out[0..32])?;
+        place_be(&s, &mut out[32..64])?;
+        Ok(out)
+    }
+
+    /// Right-align a big-endian integer into a fixed slot, stripping DER
+    /// sign-padding leading zeros and rejecting an overlong value.
+    fn place_be(int: &[u8], slot: &mut [u8]) -> Result<(), KmsError> {
+        let mut v = int;
+        while v.len() > 1 && v[0] == 0x00 {
+            v = &v[1..];
+        }
+        if v.len() > slot.len() {
+            return Err(KmsError::Malformed("ECDSA integer (overlong)"));
+        }
+        let off = slot.len() - v.len();
+        slot[off..].copy_from_slice(v);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use ring::rand::SystemRandom;
+        use ring::signature::{
+            self, EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P256_SHA256_FIXED,
+        };
+
+        #[test]
+        fn der_to_fixed_then_verifies_against_ring() {
+            let rng = SystemRandom::new();
+            let pkcs8 =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+            let kp =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                    .unwrap();
+            let msg = b"attestation signing input";
+            let der = kp.sign(&rng, msg).unwrap(); // DER, exactly like KMS returns
+            let fixed = der_ecdsa_to_p256_fixed(der.as_ref()).unwrap();
+            signature::UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, kp.public_key().as_ref())
+                .verify(msg, &fixed)
+                .expect("the converted JOSE-fixed signature verifies");
+        }
+
+        #[test]
+        fn ec_point_extracted_from_spki_tail() {
+            // <prefix> || 0x04 || x(32) || y(32) — assert the trailing-65 extractor.
+            let mut spki = vec![0u8; 26];
+            spki.push(0x04);
+            spki.extend_from_slice(&[7u8; 64]);
+            let pt = ec_point_from_spki(&spki).unwrap();
+            assert_eq!(pt[0], 0x04);
+            assert_eq!(&pt[1..], &[7u8; 64][..]);
+        }
+
+        #[test]
+        fn malformed_der_is_rejected_not_panic() {
+            assert!(der_ecdsa_to_p256_fixed(&[0x30, 0x00]).is_err());
+            assert!(der_ecdsa_to_p256_fixed(b"not-der").is_err());
+        }
     }
 }
 
@@ -295,6 +542,44 @@ mod tests {
         let att = sign(&core(), &keypair(), "k", Mode::Notary);
         let other_pub = keypair().public_key().as_ref().to_vec();
         assert!(!verify(&core(), &att, &other_pub));
+    }
+
+    #[test]
+    fn es256_attestation_verifies_via_alg_dispatch() {
+        // Build an ES256 attestation the way the KMS notary would (alg "ES256",
+        // JOSE fixed r||s) using a local P-256 key, and confirm verify() routes
+        // it to the P-256 path against the 65-byte uncompressed point.
+        use ring::rand::SystemRandom;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let kp =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
+        let point = kp.public_key().as_ref().to_vec(); // 65-byte uncompressed
+        let header = ProtectedHeader {
+            alg: "ES256".into(),
+            kid: "es-1".into(),
+            typ: TestCore::ENVELOPE_TYP.into(),
+        };
+        let protected = B64.encode(serde_json::to_vec(&header).unwrap());
+        let input = signing_input(&protected, &core());
+        let sig = kp.sign(&rng, &input).unwrap(); // FIXED → 64-byte r||s
+        let att = Attestation {
+            mode: Mode::Notary,
+            protected,
+            signature: B64.encode(sig.as_ref()),
+        };
+        assert!(verify(&core(), &att, &point));
+        // An Ed25519 key (wrong type for ES256) must not verify — no alg confusion.
+        assert!(!verify(&core(), &att, keypair().public_key().as_ref()));
+        // Tampering the core still breaks it under ES256.
+        let forged = TestCore {
+            v: 2,
+            id: "abc".into(),
+            note: None,
+        };
+        assert!(!verify(&forged, &att, &point));
     }
 
     #[test]

@@ -1,13 +1,19 @@
 [package]
 name = "attestation-envelope"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "The shared detached-JWS (Ed25519 / EdDSA) attestation envelope: one audited sign/verify over JCS-canonical cores, plus the notary signing key + JWKS. Generic over the signed core type."
+description = "The shared detached-JWS attestation envelope: one audited sign/verify over JCS-canonical cores, plus the notary signing key + JWKS. Generic over the signed core type. Supports EdDSA/Ed25519 (local key) and, under the `kms` feature, ES256/P-256 signing where the private key never leaves AWS KMS."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/stackwell-labs/attestation-envelope"
 readme = "README.md"
 keywords = ["jws", "ed25519", "attestation", "provenance"]
 categories = ["cryptography", "authentication"]
+
+[features]
+# `kms` adds the ES256/P-256 notary whose private key lives in AWS KMS (the
+# signing-input digest is signed via the KMS Sign API; the key never leaves KMS).
+# Off by default so EdDSA-only consumers (e.g. postbox) don't pull the AWS SDK.
+kms = ["dep:aws-sdk-kms"]
 
 [dependencies]
 base64 = "0.22"
@@ -15,3 +21,4 @@ ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
+aws-sdk-kms = { version = "1", optional = true }
