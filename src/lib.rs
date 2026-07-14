@@ -34,19 +34,6 @@ use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-/// How an attestation was produced.
-///
-/// `Notary` = signed by the mediating service's notary key (the only mode in
-/// use today). `E2e` is reserved for end-to-end sender-signed attestations.
-/// The mode is a label carried in the envelope; it is **not** consulted by
-/// [`verify`] — integrity rests entirely on the signature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    Notary,
-    E2e,
-}
-
 /// A core that can be attested: it declares the JWS `typ` bound into every
 /// signature over this core type, and yields its JCS-canonical bytes.
 ///
@@ -82,9 +69,17 @@ struct ProtectedHeader {
 }
 
 /// A detached JWS over a [`AttestableCore`], stored next to the row it attests.
+///
+/// Every field here is covered by the signature: `protected` is bound into the
+/// signing input verbatim, and `signature` is the signature itself. Do not add
+/// a field to this struct that [`signing_input`] does not cover — an
+/// unauthenticated field inside a security envelope is a field a reader may
+/// trust and an attacker with at-rest write access may edit. (A `mode`
+/// discriminant lived here until v0.3.0 and was exactly that: uncovered,
+/// unread, and freely mutable.) Anything that must be authenticated belongs in
+/// [`ProtectedHeader`] or in the core.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attestation {
-    pub mode: Mode,
     /// base64url(UTF8(protected_header_json))
     pub protected: String,
     /// base64url of the 64-byte signature — Ed25519, or JOSE fixed `r||s` for ES256.
@@ -102,12 +97,7 @@ fn signing_input<C: AttestableCore>(protected_b64: &str, core: &C) -> Vec<u8> {
 
 /// Sign a core with an Ed25519 key, producing one attestation.
 #[must_use]
-pub fn sign<C: AttestableCore>(
-    core: &C,
-    key: &Ed25519KeyPair,
-    kid: &str,
-    mode: Mode,
-) -> Attestation {
+pub fn sign<C: AttestableCore>(core: &C, key: &Ed25519KeyPair, kid: &str) -> Attestation {
     let header = ProtectedHeader {
         alg: "EdDSA".into(),
         kid: kid.into(),
@@ -116,7 +106,6 @@ pub fn sign<C: AttestableCore>(
     let protected = B64.encode(serde_json::to_vec(&header).expect("header serializes"));
     let sig = key.sign(&signing_input(&protected, core));
     Attestation {
-        mode,
         protected,
         signature: B64.encode(sig.as_ref()),
     }
@@ -201,10 +190,10 @@ impl NotaryKey {
         &self.kid
     }
 
-    /// Notary-sign a core (`Mode::Notary`).
+    /// Notary-sign a core with this service's notary key.
     #[must_use]
     pub fn sign<C: AttestableCore>(&self, core: &C) -> Attestation {
-        sign(core, &self.key_pair, &self.kid, Mode::Notary)
+        sign(core, &self.key_pair, &self.kid)
     }
 
     /// The JWKS document published for client-side verify.
@@ -232,7 +221,7 @@ impl NotaryKey {
 /// 65-byte uncompressed P-256 point ([`KmsNotary::public_point`] / the JWKS).
 #[cfg(feature = "kms")]
 pub mod kms {
-    use super::{signing_input, AttestableCore, Attestation, Mode, ProtectedHeader, B64};
+    use super::{signing_input, AttestableCore, Attestation, ProtectedHeader, B64};
     use base64::Engine;
     use serde_json::json;
 
@@ -308,7 +297,7 @@ pub mod kms {
             &self.point
         }
 
-        /// Notary-sign a core (`Mode::Notary`) via KMS → an ES256 attestation.
+        /// Notary-sign a core via KMS → an ES256 attestation.
         pub async fn sign<C: AttestableCore>(&self, core: &C) -> Result<Attestation, KmsError> {
             let header = ProtectedHeader {
                 alg: "ES256".into(),
@@ -333,7 +322,6 @@ pub mod kms {
                 .as_ref();
             let raw = der_ecdsa_to_p256_fixed(der)?;
             Ok(Attestation {
-                mode: Mode::Notary,
                 protected,
                 signature: B64.encode(raw),
             })
@@ -510,13 +498,13 @@ mod tests {
     fn sign_then_verify_roundtrips() {
         let key = keypair();
         let pubkey = key.public_key().as_ref().to_vec();
-        let att = sign(&core(), &key, "k", Mode::Notary);
+        let att = sign(&core(), &key, "k");
         assert!(verify(&core(), &att, &pubkey));
     }
 
     #[test]
     fn protected_header_binds_typ_and_kid() {
-        let att = sign(&core(), &keypair(), "key-9", Mode::Notary);
+        let att = sign(&core(), &keypair(), "key-9");
         let header: serde_json::Value =
             serde_json::from_slice(&B64.decode(att.protected.as_bytes()).unwrap()).unwrap();
         assert_eq!(header["alg"], "EdDSA");
@@ -528,7 +516,7 @@ mod tests {
     fn tampering_the_core_breaks_the_signature() {
         let key = keypair();
         let pubkey = key.public_key().as_ref().to_vec();
-        let att = sign(&core(), &key, "k", Mode::Notary);
+        let att = sign(&core(), &key, "k");
         let forged = TestCore {
             v: 1,
             id: "xyz".into(),
@@ -539,7 +527,7 @@ mod tests {
 
     #[test]
     fn wrong_key_does_not_verify() {
-        let att = sign(&core(), &keypair(), "k", Mode::Notary);
+        let att = sign(&core(), &keypair(), "k");
         let other_pub = keypair().public_key().as_ref().to_vec();
         assert!(!verify(&core(), &att, &other_pub));
     }
@@ -566,7 +554,6 @@ mod tests {
         let input = signing_input(&protected, &core());
         let sig = kp.sign(&rng, &input).unwrap(); // FIXED → 64-byte r||s
         let att = Attestation {
-            mode: Mode::Notary,
             protected,
             signature: B64.encode(sig.as_ref()),
         };
@@ -585,11 +572,27 @@ mod tests {
     #[test]
     fn garbage_attestation_returns_false_not_panic() {
         let att = Attestation {
-            mode: Mode::Notary,
             protected: "!!!not-base64!!!".into(),
             signature: "also-not-valid".into(),
         };
         assert!(!verify(&core(), &att, &[0u8; 32]));
+    }
+
+    /// Attestations written before v0.3.0 carry a `"mode"` key. The field was
+    /// never covered by the signature, so dropping it is not a wire break:
+    /// stored envelopes must still parse (unknown key ignored) and still
+    /// verify. Granite has such rows in its decision table.
+    #[test]
+    fn pre_v0_3_attestation_with_mode_still_parses_and_verifies() {
+        let kp = keypair();
+        let att = sign(&core(), &kp, "k");
+        let legacy = serde_json::json!({
+            "mode": "notary",
+            "protected": att.protected,
+            "signature": att.signature,
+        });
+        let parsed: Attestation = serde_json::from_value(legacy).unwrap();
+        assert!(verify(&core(), &parsed, kp.public_key().as_ref()));
     }
 
     #[test]
@@ -598,10 +601,10 @@ mod tests {
         // a fixed signature. Locks the crate's signing-input construction.
         let seed: [u8; 32] = [7u8; 32];
         let kp = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
-        let att = sign(&core(), &kp, "k1", Mode::Notary);
+        let att = sign(&core(), &kp, "k1");
         assert!(verify(&core(), &att, kp.public_key().as_ref()));
         // Same inputs → identical signature.
-        let att2 = sign(&core(), &kp, "k1", Mode::Notary);
+        let att2 = sign(&core(), &kp, "k1");
         assert_eq!(att.signature, att2.signature);
     }
 
@@ -610,7 +613,11 @@ mod tests {
         let nk = NotaryKey::ephemeral("svc").unwrap();
         assert!(nk.kid().starts_with("svc-notary-"));
         let att = nk.sign(&core());
-        assert_eq!(att.mode, Mode::Notary);
+        assert!(verify(
+            &core(),
+            &att,
+            nk.key_pair.public_key().as_ref()
+        ));
         // jwks exposes the same kid.
         assert_eq!(nk.jwks()["keys"][0]["kid"], nk.kid());
     }

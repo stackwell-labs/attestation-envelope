@@ -1,6 +1,6 @@
 [package]
 name = "attestation-envelope"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "The shared detached-JWS attestation envelope: one audited sign/verify over JCS-canonical cores, plus the notary signing key + JWKS. Generic over the signed core type. Supports EdDSA/Ed25519 (local key) and, under the `kms` feature, ES256/P-256 signing where the private key never leaves AWS KMS."
 license = "MIT OR Apache-2.0"
