@@ -1,6 +1,6 @@
 [package]
 name = "attestation-envelope"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "The shared detached-JWS attestation envelope: one audited sign/verify over JCS-canonical cores, plus the notary signing key + JWKS. Generic over the signed core type. Supports EdDSA/Ed25519 (local key) and, under the `kms` feature, ES256/P-256 signing where the private key never leaves AWS KMS."
 license = "MIT OR Apache-2.0"
@@ -21,4 +21,12 @@ ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-aws-sdk-kms = { version = "1", optional = true }
+# default-features = false drops the SDK's DEFAULT `rustls` feature, which is the
+# LEGACY TLS stack: it enables aws-smithy-runtime/tls-rustls ->
+# connector-hyper-0-14-x -> aws-smithy-http-client/hyper-014 -> hyper 0.14 ->
+# h2 0.3, and h2 0.3 has no fix for RUSTSEC-2026-0258 (patched only in
+# >= 0.4.16). Every consumer of this crate inherited that advisory through
+# aws-sdk-kms. `default-https-client` keeps HTTPS working via the modern
+# aws-lc-rs client, which was already being built alongside the legacy one —
+# so this removes a second TLS stack rather than adding one.
+aws-sdk-kms = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
